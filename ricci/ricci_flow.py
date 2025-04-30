@@ -1,238 +1,244 @@
 import numpy as np
-from sklearn.metrics import normalized_mutual_info_score
-from sklearn.metrics import adjusted_rand_score
 import networkx as nx
+import ot                      
 import itertools
 from collections import defaultdict
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
 
 
-# Compute degrees of simplices
+def build_skeleton_graph(sc, d):
+    G = nx.Graph()
+    for s in sc.simplices[d]:
+        G.add_node(s)
+    for s in sc.simplices[d]:
+        for t in sc.simplices[d]:
+            if s != t and len(set(s)&set(t)) == d:
+                G.add_edge(s, t)
+    return G
+
+
+# Precompute ground metric D[(σ,τ)] from d-skeleton graph
+def compute_ground_metric(sc, d):
+    G = build_skeleton_graph(sc, d)
+    sp = dict(nx.all_pairs_shortest_path_length(G))
+    # find the largest finite distance (graph diameter)
+    max_dist = 0
+    for u, nbrs in sp.items():
+        max_dist = max(max_dist, max(nbrs.values()))
+    unreachable = max_dist + 1  # use this for disconnected pairs
+
+    D = {}
+    for u in sc.simplices[d]:
+        for v in sc.simplices[d]:
+            if u == v:
+                D[(u, v)] = 0.0
+            else:
+                # if v reachable from u use that, else unreachable
+                D[(u, v)] = sp[u].get(v, unreachable)
+    return D
+
+def build_all_ground_metrics(sc):
+    max_dim = max(sc.simplices.keys())
+    D_dict = {}
+    # for each dimension i where we compute curvature (i < max_dim):
+    for i in range(max_dim):
+        D_dict[i] = compute_ground_metric(sc, i)
+    return D_dict
+
+
+
 def compute_degrees(sc):
     degrees = {}
     max_dim = max(sc.simplices.keys())
     for dim in sc.simplices:
         if dim < max_dim:
             for simplex in sc.simplices[dim]:
-                cofaces = get_cofaces(sc, simplex)
-                degrees[simplex] = len(cofaces)
+                degrees[simplex] = len(get_cofaces(sc, simplex))
     return degrees
 
-
-# Get cofaces of a simplex
 def get_cofaces(sc, simplex):
-    dim = len(simplex) - 1
-    cofaces = []
-    if dim + 1 in sc.simplices:
-        for coface in sc.simplices[dim + 1]:
-            if set(simplex).issubset(coface):
-                cofaces.append(coface)
-    return cofaces
+    dim = len(simplex)-1
+    out = []
+    for cf in sc.simplices.get(dim+1, []):
+        if set(simplex).issubset(cf):
+            out.append(cf)
+    return out
 
-
-# Compute probability measures for simplices
 def compute_probability_measures(sc, degrees):
     m = {}
+    max_dim = max(sc.simplices.keys())
     for dim in sc.simplices:
-        if dim < max(sc.simplices.keys()):
+        if dim < max_dim:
             for simplex in sc.simplices[dim]:
                 deg = degrees[simplex]
                 m_F = defaultdict(float)
-                cofaces = get_cofaces(sc, simplex)
-                for coface in cofaces:
-                    weight = sc.weights[coface]
-                    faces = [tuple(sorted(face)) for face in itertools.combinations(coface, dim + 1) if face != simplex]
-                    for face in faces:
-                        m_F[face] += weight / ((dim + 1) * deg)
+                for cf in get_cofaces(sc, simplex):
+                    w = sc.weights[cf]
+                    for face in itertools.combinations(cf, dim+1):
+                        f = tuple(sorted(face))
+                        if f != simplex:
+                            m_F[f] += w/((dim+1)*deg)
                 m[simplex] = m_F
     return m
 
-# Compute the curvative
-def compute_ricci_curvature(sc, m):
+def get_adjacent_simplices(sc, simplex):
+    adj = set()
+    for cf in get_cofaces(sc, simplex):
+        for face in itertools.combinations(cf, len(simplex)):
+            f = tuple(sorted(face))
+            if f != simplex:
+                adj.add(f)
+    return list(adj)
+
+def wasserstein_distance_OT(m_F, m_G, D, reg=1e-2):
+    # if either distribution empty or degenerate → distance zero
+    if not m_F or not m_G:
+        return 0.0
+
+    supp_F = list(m_F.keys())
+    supp_G = list(m_G.keys())
+    a = np.array([m_F[s] for s in supp_F], dtype=np.float64)
+    b = np.array([m_G[s] for s in supp_G], dtype=np.float64)
+    # normalize
+    suma, sumb = a.sum(), b.sum()
+    if suma > 0: a /= suma
+    else:       return 0.0
+    if sumb > 0: b /= sumb
+    else:        return 0.0
+
+    # cost matrix (all finite by construction)
+    M = np.zeros((len(supp_F), len(supp_G)), dtype=np.float64)
+    for i, u in enumerate(supp_F):
+        for j, v in enumerate(supp_G):
+            M[i, j] = D[(u, v)]
+
+    # Sinkhorn
+    try:
+        W2 = ot.sinkhorn2(a, b, M, reg)
+        return W2
+    except Exception:
+        # fallback to L1‐based if Sinkhorn fails
+        keys = set(m_F) | set(m_G)
+        l1 = sum(abs(m_F.get(k,0)-m_G.get(k,0)) for k in keys)*0.5
+        return l1
+
+
+def compute_ricci_curvature_OT(sc, m, D_dict, reg=1e-2):
     curvature = {}
+    max_dim = max(sc.simplices.keys())
     for dim in sc.simplices:
-        if dim < max(sc.simplices.keys()):
-            for simplex in sc.simplices[dim]:
-                adjacent_simplices = get_adjacent_simplices(sc, simplex)
-                kappa = {}
-                for adj in adjacent_simplices:
-                    W = wasserstein_distance(m[simplex], m[adj])
-                    kappa[adj] = 1 - W
-                curvature[simplex] = kappa
+        if dim == max_dim:
+            continue
+        D = D_dict[dim]         # pick the right cost map
+        for simplex in sc.simplices[dim]:
+            neigh = get_adjacent_simplices(sc, simplex)
+            kappa = {}
+            for nbr in neigh:
+                W = wasserstein_distance_OT(m[simplex], m[nbr], D, reg=reg)
+                kappa[nbr] = 1 - W
+            curvature[simplex] = kappa
     return curvature
 
-# Compute the Wasserstein distance
-def wasserstein_distance(m_F, m_G):
-    keys = set(m_F.keys()).union(set(m_G.keys()))
-    distance = 0.0
-    for k in keys:
-        distance += abs(m_F.get(k, 0) - m_G.get(k, 0))
-    distance *= 0.5  # Since the ground distance is 1
-    return distance
-
-
-def get_adjacent_simplices(sc, simplex):
-    adjacent = set()
-    cofaces = get_cofaces(sc, simplex)
-    for coface in cofaces:
-        faces = [tuple(sorted(face)) for face in itertools.combinations(coface, len(simplex)) if face != simplex]
-        for face in faces:
-            adjacent.add(face)
-    return list(adjacent)
-
-# Main function for Ricci flow community detection
-def ricci_flow_community_detection(sc,
-                                    T=10,
-                                    delta=0.01,
-                                    ground_truth=None, 
-                                    min_theta_range=0.3, 
-                                    theta_step=0.001
-                                    ):
-    degrees = compute_degrees(sc)
-    nmi_scores = []
-    modularity_scores = []
-    ari_scores = []
-
-    # Run Ricci flow iterations
-    for t in range(T):
-        print(f"Iteration {t + 1}/{T}")
-        m = compute_probability_measures(sc, degrees)
-        # Update weights based on the Ricci curvature computation
-
-        # Compute Ricci curvature
-        curvature = compute_ricci_curvature(sc, m)
-
-        update_weights(sc, curvature, delta)
-
-    # Compute weight range and theta values
-    max_dim = max(sc.simplices.keys())
-    all_weights = [w for s, w in sc.weights.items() if len(s) == max_dim]
-    min_weight = min(all_weights)
-    max_weight = max(all_weights)
-    print(f"Weight range after Ricci flow: min={min_weight}, max={max_weight}")
-
-    # Define theta values based on weight range
-    theta_values = np.arange(min_weight - min_theta_range, max_weight, theta_step)
-
-    # Store original simplices and weights
-    original_simplices = {dim: sc.simplices[dim].copy() for dim in sc.simplices}
-    original_weights = sc.weights.copy()
-
-    # For each theta, perform network surgery and compute metrics
-    for theta in theta_values:
-        print(f"\nApplying weight cutoff theta = {theta}")
-        # Reset simplices and weights
-        sc.simplices = {dim: original_simplices[dim].copy() for dim in original_simplices}
-        sc.weights = original_weights.copy()
-
-        # Network surgery (removal of simplices based on thresholding)
-        simplices_to_remove = [simplex for simplex, weight in sc.weights.items() if weight > theta and len(simplex) > 1]
-        for simplex in simplices_to_remove:
-            dim = len(simplex) - 1
-            if simplex in sc.simplices[dim]:
-                sc.simplices[dim].remove(simplex)
-            del sc.weights[simplex]
-
-        # Identify communities
-        communities = identify_communities(sc)
-
-        print(f"Detected {len(communities)} communities at theta={theta}")
-
-        # If ground truth is provided, compute NMI and ARI
-        if ground_truth is not None:
-            detected_labels = node_labels_from_communities_dict(communities)
-            ground_truth_node_ids = set(ground_truth.keys())
-            detected_node_ids = set(detected_labels.keys())
-            common_node_ids = ground_truth_node_ids & detected_node_ids
-            aligned_node_ids = sorted(common_node_ids)
-
-            aligned_ground_truth_labels = [ground_truth[node_id] for node_id in aligned_node_ids]
-            aligned_detected_labels = [detected_labels[node_id] for node_id in aligned_node_ids]
-
-            valid_indices = [i for i, label in enumerate(aligned_ground_truth_labels) if label != -1]
-
-            filtered_ground_truth_labels = [aligned_ground_truth_labels[i] for i in valid_indices]
-            filtered_detected_labels = [aligned_detected_labels[i] for i in valid_indices]
-            
-
-            # Compute NMI and ARI
-            nmi = normalized_mutual_info_score(filtered_ground_truth_labels, filtered_detected_labels)
-            nmi_scores.append(nmi)
-            ari = adjusted_rand_score(filtered_ground_truth_labels, filtered_detected_labels)
-            ari_scores.append(ari)
-            print(f"NMI Score: {nmi}")
-            print(f"ARI Score: {ari}")
-        else:
-            nmi_scores.append(None)
-            ari_scores.append(None)
-
-        try:
-          modularity = compute_modularity(sc, communities)
-        except:
-          modularity = 0        
-          
-        modularity_scores.append(modularity)  
-        print(f"Modularity: {modularity}")
-
-    return nmi_scores, modularity_scores, theta_values, ari_scores
-
-
-# Update weights based on Ricci curvature
 def update_weights(sc, curvature, delta):
-    new_weights = sc.weights.copy()
+    new_w = sc.weights.copy()
+    max_dim = max(sc.simplices.keys())
     for dim in sc.simplices:
-        if dim < max(sc.simplices.keys()) - 1:
-            for simplex in sc.simplices[dim]:
-                kappa_values = list(curvature.get(simplex, {}).values())
-                if kappa_values:
-                    avg_kappa = np.mean(kappa_values)
-                    cofaces = get_cofaces(sc, simplex)
-                    for coface in cofaces:
-                        new_weights[coface] *= np.exp(-delta * avg_kappa / (len(simplex)))
-    sc.weights = new_weights
+        if dim < max_dim:
+            for s in sc.simplices[dim]:
+                ks = list(curvature.get(s, {}).values())
+                if not ks: continue
+                avg = np.mean(ks)
+                for cf in get_cofaces(sc, s):
+                    new_w[cf] *= np.exp(-delta * avg / len(s))
+    sc.weights = new_w
 
-# Identify communities from simplicial complex
 def identify_communities(sc):
     G = nx.Graph()
     G.add_nodes_from([v[0] for v in sc.simplices[0]])
     G.add_edges_from(sc.simplices[1])
+    return list(nx.connected_components(G))
 
-    components = list(nx.connected_components(G))
-    return components
-
-
-# Compute modularity of a community partition
 def compute_modularity(sc, communities):
+    # rebuild the simple 1‐skeleton graph
     G = nx.Graph()
     G.add_nodes_from([v[0] for v in sc.simplices[0]])
     G.add_edges_from(sc.simplices[1])
 
-    community_list = []
-    for community in communities:
-        community_list.append(set(community))
+    # if there are no edges, modularity is 0 by definition
+    if G.number_of_edges() == 0:
+        return 0.0
 
-    modularity = nx.algorithms.community.modularity(G, community_list)
-    return modularity
-
-
-# Convert communities to node labels
-def node_labels_from_communities_dict(communities):
-    node_labels = {}
-    for label, community in enumerate(communities):
-        for node in community:
-            node_labels[node] = label
-    return node_labels
+    # else safely compute
+    return nx.algorithms.community.modularity(G, [set(c) for c in communities])
 
 
-# Convert detected communities to node labels
-def node_labels_from_communities(communities, num_nodes=None):
-    node_labels = {}
-    for label, community in enumerate(communities):
-        for node in community:
-            node_labels[node] = label
-
-    if num_nodes is not None:
-        labels = [node_labels.get(node, -1) for node in range(num_nodes)]  # Default label is -1 for unlabeled nodes
-    else:
-        labels = [node_labels[node] for node in sorted(node_labels.keys())]
-
+def node_labels_from_communities_dict(comms):
+    labels = {}
+    for i, c in enumerate(comms):
+        for v in c:
+            labels[v] = i
     return labels
+
+
+def ricci_flow_community_detection(sc,
+                                   T=10,
+                                   delta=0.01,
+                                   reg=1e-2,
+                                   ground_truth=None,
+                                   min_theta_range=0.3,
+                                   theta_step=0.001):
+    # precompute ground metric on (d-1)-simplices
+    d = max(sc.simplices.keys()) - 1
+    D = compute_ground_metric(sc, d)
+
+    D_dict = build_all_ground_metrics(sc)
+
+    degrees = compute_degrees(sc)
+    nmi_scores, modularity_scores, ari_scores = [], [], []
+
+    # Ricci flow loop
+    for t in range(T):
+        print(f"Iteration {t+1}/{T}")
+        m = compute_probability_measures(sc, degrees)
+        curvature = compute_ricci_curvature_OT(sc, m, D_dict, reg=reg)
+        update_weights(sc, curvature, delta)
+
+    # after flow, collect weight statistics
+    max_dim = max(sc.simplices.keys())
+    all_w = [w for s, w in sc.weights.items() if len(s)==max_dim]
+    w_min, w_max = min(all_w), max(all_w)
+    print(f"Weight range after flow: min={w_min:.3g}, max={w_max:.3g}")
+
+    # prepare theta sweep
+    theta_values = np.arange(w_min-min_theta_range, w_max, theta_step)
+    orig_simp = {d: sc.simplices[d].copy() for d in sc.simplices}
+    orig_w    = sc.weights.copy()
+
+    for θ in theta_values:
+        sc.simplices = {d: orig_simp[d].copy() for d in orig_simp}
+        sc.weights   = orig_w.copy()
+
+        # prune
+        to_remove = [s for s,w in sc.weights.items() if w>θ and len(s)>1]
+        for s in to_remove:
+            dim = len(s)-1
+            sc.simplices[dim].discard(s)
+            sc.weights.pop(s, None)
+
+        comms = identify_communities(sc)
+        print(f" θ={θ:.3f} → {len(comms)} communities")
+
+        if ground_truth:
+            detected = node_labels_from_communities_dict(comms)
+            common = sorted(set(ground_truth)&set(detected))
+            gt = [ground_truth[v] for v in common]
+            dt = [detected[v] for v in common]
+            nmi_scores.append(normalized_mutual_info_score(gt, dt))
+            ari_scores.append(adjusted_rand_score(gt, dt))
+        else:
+            nmi_scores.append(None)
+            ari_scores.append(None)
+
+        modularity_scores.append(compute_modularity(sc, comms))
+
+    return nmi_scores, modularity_scores, theta_values, ari_scores
