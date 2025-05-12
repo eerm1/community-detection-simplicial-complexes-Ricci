@@ -4,6 +4,8 @@ import ot
 import itertools
 from collections import defaultdict
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+import matplotlib.pyplot as plt
+
 
 
 def build_skeleton_graph(sc, d):
@@ -28,13 +30,15 @@ def compute_ground_metric(sc, d):
     unreachable = max_dist + 1  # use this for disconnected pairs
 
     D = {}
-    for u in sc.simplices[d]:
-        for v in sc.simplices[d]:
+    simplices = sc.simplices[d]
+    for u in simplices:
+        for v in simplices:
             if u == v:
                 D[(u, v)] = 0.0
             else:
-                # if v reachable from u use that, else unreachable
-                D[(u, v)] = sp[u].get(v, unreachable)
+                intersection_size = len(set(u) & set(v))
+                # The more intersection, the smaller the distance
+                D[(u, v)] = 1.0 - intersection_size / (d + 1)
     return D
 
 def build_all_ground_metrics(sc):
@@ -82,15 +86,16 @@ def compute_probability_measures(sc, degrees):
     return m
 
 def get_adjacent_simplices(sc, simplex):
-    adj = set()
-    for cf in get_cofaces(sc, simplex):
-        for face in itertools.combinations(cf, len(simplex)):
-            f = tuple(sorted(face))
-            if f != simplex:
-                adj.add(f)
-    return list(adj)
+    dim = len(simplex) - 1
+    adjacent = set()
+    # find simplices of the same dimension with a common face of dimension (dim - 1)
+    for candidate in sc.simplices[dim]:
+        if candidate != simplex and len(set(candidate) & set(simplex)) == dim:
+            adjacent.add(candidate)
+    return list(adjacent)
 
-def wasserstein_distance_OT(m_F, m_G, D, reg=1e-2):
+
+def wasserstein_distance_OT(m_F, m_G, D, reg=0.1):
     # if either distribution empty or degenerate → distance zero
     if not m_F or not m_G:
         return 0.0
@@ -149,7 +154,7 @@ def update_weights(sc, curvature, delta):
                 if not ks: continue
                 avg = np.mean(ks)
                 for cf in get_cofaces(sc, s):
-                    new_w[cf] *= np.exp(-delta * avg / len(s))
+                    new_w[cf] *= max(0, 1 - delta * avg / len(s))
     sc.weights = new_w
 
 def identify_communities(sc):
@@ -209,10 +214,24 @@ def ricci_flow_community_detection(sc,
     w_min, w_max = min(all_w), max(all_w)
     print(f"Weight range after flow: min={w_min:.3g}, max={w_max:.3g}")
 
+    # Rescale weights to [0,1]
+    all_weights = list(sc.weights.values())
+    w_min, w_max = min(all_weights), max(all_weights)
+
+    for simplex in sc.weights:
+        sc.weights[simplex] = (sc.weights[simplex] - w_min) / (w_max - w_min)
+
+
     # prepare theta sweep
     theta_values = np.arange(w_min-min_theta_range, w_max, theta_step)
     orig_simp = {d: sc.simplices[d].copy() for d in sc.simplices}
     orig_w    = sc.weights.copy()
+
+    plt.hist(list(sc.weights.values()), bins=30)
+    plt.title('Weights distribution before surgery')
+    plt.xlabel('Weight')
+    plt.ylabel('Frequency')
+    plt.show()
 
     for θ in theta_values:
         sc.simplices = {d: orig_simp[d].copy() for d in orig_simp}
