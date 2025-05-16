@@ -8,27 +8,8 @@ import matplotlib.pyplot as plt
 
 
 
-def build_skeleton_graph(sc, d):
-    G = nx.Graph()
-    for s in sc.simplices[d]:
-        G.add_node(s)
-    for s in sc.simplices[d]:
-        for t in sc.simplices[d]:
-            if s != t and len(set(s)&set(t)) == d:
-                G.add_edge(s, t)
-    return G
-
-
-# Precompute ground metric D[(σ,τ)] from d-skeleton graph
+# Precompute ground metric D[(F,G)]
 def compute_ground_metric(sc, d):
-    G = build_skeleton_graph(sc, d)
-    sp = dict(nx.all_pairs_shortest_path_length(G))
-    # find the largest finite distance (graph diameter)
-    max_dist = 0
-    for u, nbrs in sp.items():
-        max_dist = max(max_dist, max(nbrs.values()))
-    unreachable = max_dist + 1  # use this for disconnected pairs
-
     D = {}
     simplices = sc.simplices[d]
     for u in simplices:
